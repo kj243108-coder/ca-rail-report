@@ -1,13 +1,12 @@
 import os
 import re
-import json
 import feedparser
 import requests
 from datetime import datetime, timezone
+from deep_translator import GoogleTranslator
 
 NOTION_TOKEN    = os.getenv("NOTION_TOKEN")
 DATABASE_ID     = os.getenv("NOTION_DATABASE_ID")
-ANTHROPIC_KEY   = os.getenv("ANTHROPIC_API_KEY")
 
 NOTION_HEADERS = {
     "Authorization": f"Bearer {NOTION_TOKEN}",
@@ -38,6 +37,20 @@ CARGO_KEYWORDS = {
     "자동차/중장비":  ["automotive", "vehicle", "heavy equipment", "machinery"],
 }
 
+# 중앙아시아 필수 키워드 - 반드시 하나 이상 포함돼야 수집
+CENTRAL_ASIA_REQUIRED = [
+    "kazakhstan", "kazakh", "ktz",
+    "uzbekistan", "uzbek",
+    "kyrgyzstan", "kyrgyz",
+    "turkmenistan", "turkmen",
+    "tajikistan", "tajik",
+    "central asia",
+    "silk road", "middle corridor", "trans-caspian",
+    "belt and road", "bri",
+    "china-europe rail", "china europe rail",
+    "eurasian corridor", "titr",
+]
+
 RSS_FEEDS = [
     {"url": "https://www.railwaysupply.net/rss",      "name": "Railway Supply"},
     {"url": "https://www.silkroadbriefing.com/feed/", "name": "Silk Road Briefing"},
@@ -52,65 +65,57 @@ def get_today_str():
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 
+def get_week_str():
+    return datetime.now(timezone.utc).strftime("%Y-W%W")
+
+
 def classify(text, keyword_map):
     text_lower = text.lower()
     return [tag for tag, kws in keyword_map.items() if any(k in text_lower for k in kws)]
 
 
 def is_central_asia_related(text):
-    all_kws = [kw for kws in ROUTE_KEYWORDS.values() for kw in kws]
-    general = [
-        "central asia", "silk road", "eurasian", "belt and road", "bri",
-        "china rail", "trans-caspian", "middle corridor", "freight", "logistics",
-    ]
-    return any(kw in text.lower() for kw in all_kws + general)
+    text_lower = text.lower()
+    return any(kw in text_lower for kw in CENTRAL_ASIA_REQUIRED)
 
 
 def strip_html(text):
     return re.sub(r"<[^>]+>", "", text).strip()
 
 
-def translate_to_korean(title, summary):
-    """Claude API로 제목과 요약을 한국어로 번역"""
-    if not ANTHROPIC_KEY:
-        print("  [번역 생략] ANTHROPIC_API_KEY 없음")
-        return title, summary
-
-    prompt = f"""다음 물류/운임 뉴스를 한국어로 번역해주세요.
-물류, 철도, 해운 전문 용어는 정확하게 번역하고, 자연스러운 한국어로 작성해주세요.
-반드시 JSON 형식으로만 응답하세요. 다른 텍스트는 포함하지 마세요.
-
-제목: {title}
-요약: {summary}
-
-응답 형식:
-{{"제목": "번역된 제목", "요약": "번역된 요약"}}"""
-
+def is_duplicate(url):
+    """Notion DB에 동일 URL이 있으면 True 반환"""
+    if not url:
+        return False
     try:
         res = requests.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={
-                "x-api-key": ANTHROPIC_KEY,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json",
-            },
+            f"https://api.notion.com/v1/databases/{DATABASE_ID}/query",
+            headers=NOTION_HEADERS,
             json={
-                "model": "claude-sonnet-4-20250514",
-                "max_tokens": 1000,
-                "messages": [{"role": "user", "content": prompt}],
+                "filter": {
+                    "property": "출처URL",
+                    "url": {"equals": url}
+                }
             },
-            timeout=30,
+            timeout=10,
         )
         if res.status_code == 200:
-            raw = res.json()["content"][0]["text"].strip()
-            data = json.loads(raw)
-            print(f"  ✅ 번역 완료: {data['제목'][:40]}")
-            return data["제목"], data["요약"]
-        else:
-            print(f"  ⚠️ 번역 API 오류: {res.status_code}")
-            return title, summary
+            return len(res.json().get("results", [])) > 0
     except Exception as e:
-        print(f"  ⚠️ 번역 실패: {e}")
+        print(f"  ⚠️ 중복 확인 실패: {e}")
+    return False
+
+
+def translate_to_korean(title, summary):
+    """Google 번역 (무료, API 키 불필요)"""
+    try:
+        translator = GoogleTranslator(source='auto', target='ko')
+        ko_title   = translator.translate(title) or title
+        ko_summary = translator.translate(summary[:500]) if summary else ""
+        print(f"  ✅ 번역 완료: {ko_title[:40]}")
+        return ko_title, ko_summary
+    except Exception as e:
+        print(f"  ⚠️ 번역 실패 (원문 사용): {e}")
         return title, summary
 
 
@@ -125,8 +130,10 @@ def fetch_articles():
                 summary  = strip_html(entry.get("summary", ""))
                 link     = entry.get("link", "")
                 combined = f"{title} {summary}"
+
                 if not is_central_asia_related(combined):
                     continue
+
                 articles.append({
                     "title":    title,
                     "summary":  summary[:500] if summary else "",
@@ -142,7 +149,13 @@ def fetch_articles():
 
 
 def save_to_notion(article):
-    today = get_today_str()
+    today    = get_today_str()
+    week_str = get_week_str()
+
+    # 중복 확인
+    if is_duplicate(article["url"]):
+        print(f"  ⏭️ 중복 건너뜀: {article['title'][:50]}")
+        return
 
     # 한국어 번역
     print(f"  번역 중: {article['title'][:50]}")
@@ -150,7 +163,7 @@ def save_to_notion(article):
 
     props = {
         "제목":     {"title": [{"text": {"content": ko_title}}]},
-        "주차":     {"rich_text": [{"text": {"content": today}}]},
+        "주차":     {"rich_text": [{"text": {"content": week_str}}]},
         "수집일":   {"date": {"start": today}},
         "출처":     {"rich_text": [{"text": {"content": article["source"]}}]},
         "출처URL":  {"url": article["url"] or None},
